@@ -63,7 +63,7 @@ RUN pip3 install packaging
 RUN pip3 uninstall -y ninja && pip3 install ninja
 RUN pip3 install flash-attn --no-build-isolation
 RUN pip3 install open3d
-RUN pip3 install umap-learn seaborn pandas numpy scikit-learn scikit-image matplotlib medmnist opencv-python
+RUN pip3 install umap-learn seaborn pandas numpy<2 scikit-learn scikit-image matplotlib medmnist opencv-python
 RUN pip3 install natsort dijkstar
 ## error fix for datatable
 RUN cp /usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.30 /opt/conda/lib/
