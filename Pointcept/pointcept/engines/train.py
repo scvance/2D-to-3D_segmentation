@@ -178,12 +178,43 @@ class Trainer(TrainerBase):
         for key in input_dict.keys():
             if isinstance(input_dict[key], torch.Tensor):
                 input_dict[key] = input_dict[key].cuda(non_blocking=True)
+        self.optimizer.zero_grad(set_to_none=True)
         with torch.cuda.amp.autocast(enabled=self.cfg.enable_amp):
             output_dict = self.model(input_dict)
             loss = output_dict["loss"]
-        self.optimizer.zero_grad()
+        self.comm_info["model_output_dict"] = output_dict
+        if not torch.isfinite(loss):
+            self.logger.warning(
+                "Skipping epoch %s iter %s due to non-finite loss.",
+                self.epoch + 1,
+                self.comm_info["iter"] + 1,
+            )
+            if "iter_info" in self.comm_info.keys():
+                self.comm_info["iter_info"] += "SkipNonFiniteLoss 1 "
+            if self.cfg.empty_cache:
+                torch.cuda.empty_cache()
+            return
+
+        grad_max_norm = getattr(self.cfg, "grad_max_norm", None)
         if self.cfg.enable_amp:
             self.scaler.scale(loss).backward()
+            if grad_max_norm is not None:
+                self.scaler.unscale_(self.optimizer)
+                grad_norm = nn.utils.clip_grad_norm_(
+                    self.model.parameters(), grad_max_norm
+                )
+                if not torch.isfinite(grad_norm).all():
+                    self.logger.warning(
+                        "Skipping epoch %s iter %s due to non-finite grad norm.",
+                        self.epoch + 1,
+                        self.comm_info["iter"] + 1,
+                    )
+                    self.optimizer.zero_grad(set_to_none=True)
+                    if "iter_info" in self.comm_info.keys():
+                        self.comm_info["iter_info"] += "SkipNonFiniteGrad 1 "
+                    if self.cfg.empty_cache:
+                        torch.cuda.empty_cache()
+                    return
             self.scaler.step(self.optimizer)
 
             # When enable amp, optimizer.step call are skipped if the loss scaling factor is too large.
@@ -194,11 +225,26 @@ class Trainer(TrainerBase):
                 self.scheduler.step()
         else:
             loss.backward()
+            if grad_max_norm is not None:
+                grad_norm = nn.utils.clip_grad_norm_(
+                    self.model.parameters(), grad_max_norm
+                )
+                if not torch.isfinite(grad_norm).all():
+                    self.logger.warning(
+                        "Skipping epoch %s iter %s due to non-finite grad norm.",
+                        self.epoch + 1,
+                        self.comm_info["iter"] + 1,
+                    )
+                    self.optimizer.zero_grad(set_to_none=True)
+                    if "iter_info" in self.comm_info.keys():
+                        self.comm_info["iter_info"] += "SkipNonFiniteGrad 1 "
+                    if self.cfg.empty_cache:
+                        torch.cuda.empty_cache()
+                    return
             self.optimizer.step()
             self.scheduler.step()
         if self.cfg.empty_cache:
             torch.cuda.empty_cache()
-        self.comm_info["model_output_dict"] = output_dict
 
     def build_model(self):
         model = build_model(self.cfg.model)
