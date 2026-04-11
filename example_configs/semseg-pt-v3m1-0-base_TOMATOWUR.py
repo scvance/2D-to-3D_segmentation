@@ -2,15 +2,17 @@ _base_ = ["../Pointcept/configs/_base_/default_runtime.py"]
 # import os
 # import json
 # misc custom setting
-batch_size = 4  # bs: total bs in all gpus
-mix_prob = 0.8
-empty_cache = False
-enable_amp = True
+batch_size = 2  # bs: total bs in all gpus
+mix_prob = 0.0
+empty_cache = True
+enable_amp = False
+grad_max_norm = 1.0
 
 
 # dataset settings
 # dataset_type = "MarvinDatasetCSV"
 dataset_type = "TomatoWURCSV"
+# data_root = "TomatoWUR/data/TomatoWUR/ann_versions/partial-v1/json/" 
 data_root = "TomatoWUR/data/TomatoWUR/ann_versions/0-paper-2Dto3D/json/"
 
 train_name = data_root + "train.json"
@@ -59,9 +61,9 @@ model = dict(
         shuffle_orders=True,
         pre_norm=True,
         enable_rpe=False,
-        enable_flash=True,
-        upcast_attention=False,
-        upcast_softmax=False,
+        enable_flash=False,
+        upcast_attention=True,
+        upcast_softmax=True,
         cls_mode=False,
         pdnorm_bn=False,
         pdnorm_ln=False,
@@ -76,7 +78,7 @@ model = dict(
     ],
 )
 
-def_lr = 0.006
+def_lr = 0.002
 
 # scheduler settings
 epoch = 600 # 60 for testing otherwise 600
@@ -103,6 +105,9 @@ data = dict(
         # data_root=data_root,
         type=dataset_type,
         lr_file = train_name,
+        min_rows=3,
+        min_voxels=8,
+        min_points_after_transform=16,
         transform=[
             dict(type="CenterShift", apply_z=True),
             dict(
@@ -130,7 +135,7 @@ data = dict(
                 mode="train",
                 return_grid_coord=True,
             ),
-            dict(type="SphereCrop", point_max=102400, mode="random"),
+            dict(type="SphereCrop", point_max=65536, mode="random"),
             dict(type="CenterShift", apply_z=False),
             dict(type="NormalizeColor"),
             # dict(type="ShufflePoint"),
