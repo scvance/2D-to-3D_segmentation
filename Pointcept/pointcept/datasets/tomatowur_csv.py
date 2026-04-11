@@ -5,6 +5,8 @@ Author: Xiaoyang Wu (xiaoyang.wu.cs@gmail.com)
 Please cite our work if the code is helpful to you.
 """
 
+import csv
+import math
 import os
 import glob
 import numpy as np
@@ -61,12 +63,19 @@ class TomatoWURCSV(Dataset):
         test_cfg=None,
         cache=False,
         loop=1,
+        min_rows=3,
+        min_voxels=2,
+        min_points_after_transform=2,
     ):
         super(TomatoWURCSV, self).__init__()
         self.data_root = data_root
         self.split = split
+        self.filter_grid_size = self._infer_grid_size(transform)
         self.transform = Compose(transform)
         self.cache = cache
+        self.min_rows = min_rows if not test_mode else 1
+        self.min_voxels = min_voxels if not test_mode else 1
+        self.min_points_after_transform = min_points_after_transform if not test_mode else 1
         self.loop = (
             loop if not test_mode else 1
         )  # force make loop = 1 while in test mode
@@ -85,18 +94,92 @@ class TomatoWURCSV(Dataset):
             with open(lr_file, "r") as f:
                 data = json.load(f)
             print("USING NEW APPROACH")
-            self.pc_list = [str(Path(lr_file).parent / x["file_name"]) for x in data]
-            self.data_list = [str(Path(lr_file).parent / x["sem_seg_file_name"]) for x in data]
+            pairs = [
+                (
+                    str(Path(lr_file).parent / item["file_name"]),
+                    str(Path(lr_file).parent / item["sem_seg_file_name"]),
+                )
+                for item in data
+            ]
+            valid_pairs = []
+            invalid_pairs = []
+            for pc_path, seg_path in pairs:
+                if self._sample_is_valid(pc_path, seg_path):
+                    valid_pairs.append((pc_path, seg_path))
+                else:
+                    invalid_pairs.append((pc_path, seg_path))
+            self.pc_list = [pc_path for pc_path, _ in valid_pairs]
+            self.data_list = [seg_path for _, seg_path in valid_pairs]
         else:
             self.data_list = self.get_data_list()
         self.la = torch.load(la_file) if la_file else None
         self.ignore_index = ignore_index
         logger = get_root_logger()
+        if lr_file and invalid_pairs:
+            preview = ", ".join(Path(seg_path).name for _, seg_path in invalid_pairs[:5])
+            logger.warning(
+                "Filtered %s empty or too-small TomatoWUR CSV samples from %s with min_rows=%s, min_voxels=%s. Examples: %s",
+                len(invalid_pairs),
+                lr_file,
+                self.min_rows,
+                self.min_voxels,
+                preview,
+            )
         logger.info(
             "Totally {} x {} samples in {} set.".format(
                 len(self.data_list), self.loop, split
             )
         )
+        if len(self.data_list) == 0:
+            raise RuntimeError(
+                f"No valid TomatoWUR samples found in {lr_file or self.data_root}"
+            )
+
+    def _sample_is_valid(self, pc_path, seg_path):
+        return self._csv_meets_minimum(
+            seg_path, min_rows=self.min_rows
+        ) and self._csv_meets_minimum(
+            pc_path,
+            min_rows=self.min_rows,
+            min_voxels=self.min_voxels,
+            grid_size=self.filter_grid_size,
+        )
+
+    @staticmethod
+    def _infer_grid_size(transform_cfg):
+        if not transform_cfg:
+            return None
+        for item in transform_cfg:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "GridSample" and "grid_size" in item:
+                return item["grid_size"]
+        return None
+
+    @staticmethod
+    def _csv_meets_minimum(path, min_rows=1, min_voxels=1, grid_size=None):
+        row_count = 0
+        voxels = set()
+        try:
+            with open(path, "r", encoding="utf-8", newline="") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    row_count += 1
+                    if grid_size is not None and min_voxels > 1:
+                        voxels.add(
+                            (
+                                math.floor(float(row["x"]) / grid_size),
+                                math.floor(float(row["y"]) / grid_size),
+                                math.floor(float(row["z"]) / grid_size),
+                            )
+                        )
+                    if row_count >= min_rows and len(voxels) >= min_voxels:
+                        return True
+        except OSError:
+            return False
+        if grid_size is None or min_voxels <= 1:
+            return row_count >= min_rows
+        return row_count >= min_rows and len(voxels) >= min_voxels
 
     def get_data_list(self):
         if isinstance(self.split, str):
@@ -161,10 +244,22 @@ class TomatoWURCSV(Dataset):
         return os.path.basename(self.data_list[idx % len(self.data_list)]).split(".")[0]
 
     def prepare_train_data(self, idx):
-        # load data
-        data_dict = self.get_data(idx)
-        data_dict = self.transform(data_dict)
-        return data_dict
+        # Retry a few times in case a transform collapses a sample unexpectedly.
+        for retry in range(min(len(self.data_list), 10)):
+            data_dict = self.get_data((idx + retry) % len(self.data_list))
+            if data_dict["coord"].shape[0] < self.min_points_after_transform:
+                continue
+            try:
+                data_dict = self.transform(data_dict)
+            except ValueError as exc:
+                if "zero-size array to reduction operation" in str(exc):
+                    continue
+                raise
+            if data_dict["coord"].shape[0] >= self.min_points_after_transform:
+                return data_dict
+        raise RuntimeError(
+            "Failed to prepare a sufficiently large TomatoWUR training sample after retries."
+        )
 
     def prepare_test_data(self, idx):
         # load data
