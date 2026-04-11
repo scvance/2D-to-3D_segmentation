@@ -126,6 +126,31 @@ docker run --rm --gpus all --shm-size 8g     -v /path/to/2D-to-3D_segmentation:/
     '
 ```
 
+## Visualizing Results
+
+You can run w/o docker if you have a python environment:
+You need both the point clouds (`--point-cloud-root`) and the predictions. the predictions are just labels so without the pointclouds you cannot visualize them.
+
+Use `--pred` instead of `--sample-prefix` if you don't want to merge all partials under a particular plant
+
+```bash
+python visualize_prediction.py \
+    --sample-prefix Harvest_01_PotNr_95 \
+    --coord-decimals 4 \
+    --point-cloud-root /path/to/TomatoWUR/data/TomatoWUR/ann_versions/partial-v1/point_clouds \
+    --pred-root /path/to/results/with/.npz \
+    --output-ply /path/to/results/Harvest_01_PotNr_95_merged_conflicts_d4.ply \
+    --no-show
+```
+
+Or you can run it in a docker container:
+
+```bash
+docker run --rm -v /path/to/2D-to-3D_segmentation:/workspace/plant3d 2d-to-3d_segmentation-interactive:numpy1-fix
+  │ bash -lc 'cd /workspace/plant3d && python visualize_prediction.py --sample-prefix Harvest_02_PotNr_27 --coord-decimals 4
+  │ --output-ply /workspace/plant3d/exp/ptv3-partial-v1-safe/result/Harvest_02_PotNr_27_merged_conflicts_d4.ply --no-show'
+```
+
 
 ## Acknowledgement
 This github would not be possible without open acces of several important libraries. Many credits to those librabies.
