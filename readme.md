@@ -94,12 +94,36 @@ Training a semantic segmenation algorithm is done using the json in the dataset 
 train_tomatoWUR.sh
 ```
 
+```bash
+docker run --rmit --gpus all --shm-size 8g     -v /path/to/2D-to-3D_segmentation:/workspace/plant3d     2d-to-3d_segmentation-interactive:numpy1-fix     bash -lc '
+      cd /workspace/plant3d &&
+      export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True &&
+      python3 Pointcept/tools/train.py \
+        --config-file example_configs/semseg-pt-v3m1-0-base_TOMATOWUR.py \
+        --num-gpus 1 \                                                    
+        --options save_path=exp/ptv3-partial-v1-safe
+    '
+```
+
 ## Inference Pointcept
 This will run the algorithm with pt3 from paper. Saves the prediction in a npy file in the save_path + result folder. Weights are available on request.
 
 ```
 python Pointcept/tools/test.py --config-file example_configs/semseg-pt-v3m1-0-base.py --num-gpus 1 --options weight=example_configs/20240516_2022_ptv3_pretrained_default_lr_model_best.pth save_path=example_data/output_ptv3/
 
+```
+
+```bash
+docker run --rm --gpus all --shm-size 8g     -v /path/to/2D-to-3D_segmentation:/workspace/plant3d 2d-to-3d_segmentation-interactive:numpy1-fix     bash -lc '
+      cd /workspace/plant3d &&
+      mkdir -p example_data/output_ptv3 &&
+      python3 Pointcept/tools/test.py \
+        --config-file example_configs/semseg-pt-v3m1-0-base_TOMATOWUR.py \
+        --num-gpus 1 \
+        --options \
+          weight=/path/to/best/pointmodel.pth \
+          save_path=example_data/output_ptv3_trained_partial_eval_full
+    '
 ```
 
 
