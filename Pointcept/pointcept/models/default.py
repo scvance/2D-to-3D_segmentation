@@ -67,6 +67,76 @@ class DefaultSegmentorV2(nn.Module):
 
 
 @MODELS.register_module()
+class TrajectorySegmentorV2(DefaultSegmentorV2):
+    TRAJECTORY_META_KEYS = {
+        "plant",
+        "sequence_id",
+        "frame_name",
+        "frame_index",
+        "frame_position",
+        "num_frames",
+        "is_first_frame",
+        "is_last_frame",
+        "reset_state",
+    }
+
+    def __init__(
+        self,
+        num_classes,
+        backbone_out_channels,
+        backbone=None,
+        criteria=None,
+    ):
+        super().__init__(
+            num_classes=num_classes,
+            backbone_out_channels=backbone_out_channels,
+            backbone=backbone,
+            criteria=criteria,
+        )
+        self.hidden_state = None
+        self.current_sequence_id = None
+
+    def reset_sequence_state(self):
+        self.hidden_state = None
+        self.current_sequence_id = None
+
+    def _frame_input_dict(self, input_dict):
+        return {
+            key: value
+            for key, value in input_dict.items()
+            if key not in self.TRAJECTORY_META_KEYS
+        }
+
+    def _update_sequence_state(self, input_dict):
+        sequence_id = input_dict.get("sequence_id")
+        reset_state = bool(input_dict.get("reset_state", False))
+        if reset_state or (
+            sequence_id is not None and sequence_id != self.current_sequence_id
+        ):
+            self.hidden_state = None
+            self.current_sequence_id = sequence_id
+        elif sequence_id is not None and self.current_sequence_id is None:
+            self.current_sequence_id = sequence_id
+
+    def forward(self, input_dict):
+        self._update_sequence_state(input_dict)
+        frame_input = self._frame_input_dict(input_dict)
+        point = Point(frame_input)
+        point = self.backbone(point)
+        seg_logits = self.seg_head(point.feat)
+        if self.training:
+            output_dict = dict(loss=self.criteria(seg_logits, frame_input["segment"]))
+        elif "segment" in frame_input.keys():
+            loss = self.criteria(seg_logits, frame_input["segment"])
+            output_dict = dict(loss=loss, seg_logits=seg_logits)
+        else:
+            output_dict = dict(seg_logits=seg_logits)
+        if bool(input_dict.get("is_last_frame", False)):
+            self.reset_sequence_state()
+        return output_dict
+
+
+@MODELS.register_module()
 class DefaultClassifier(nn.Module):
     def __init__(
         self,

@@ -86,6 +86,76 @@ In the paper the 3D point clouds are made using the MaxiMarvin setup in NPEC (Wa
 The code for the MaxiMarvin is not available. However, to test the proof of concept please have a look at the TomatoWUR\Wurtomato.py -> voxel_carving function
 
 
+## Build TomatoWUR training bundles
+Pointcept training in this repo uses generated manifests under:
+
+`TomatoWUR/data/TomatoWUR/ann_versions/<version-name>/json/`
+
+For the original frame-wise partial bundles, use the existing `train.json`,
+`val.json`, and `test.json` manifests. For trajectory experiments, the same
+splitter now also writes:
+
+- `train_trajectories.json`
+- `val_trajectories.json`
+- `test_trajectories.json`
+- `all_trajectories.json`
+
+The trajectory manifests preserve frame order inside each trajectory and expose
+sequence boundaries to the loader so a future recurrent model can reset hidden
+state at the start of each sequence.
+
+### Frame-wise partial bundle
+Example splitter command in Docker:
+
+```bash
+docker compose run --rm \
+  -v /path/to/annotations_partial:/data/annotations_partial \
+  -v /path/to/point_clouds_partial:/data/point_clouds_partial \
+  interactive python3 /workspace/plant3d/TomatoWUR/data/TomatoWUR/build_partial_ann_version.py \
+  --annotations-root /data/annotations_partial \
+  --point-clouds-root /data/point_clouds_partial \
+  --version-name partial-v1 \
+  --pairing-mode strict \
+  --split-unit plant \
+  --train-ratio 0.8 \
+  --val-ratio 0.1 \
+  --test-ratio 0.1 \
+  --seed 123 \
+  --materialize-mode copy
+```
+
+### Trajectory-aware bundle
+Recommended splitter command for trajectory data in Docker. Run it once with
+`--dry-run` first, then remove `--dry-run` to materialize the bundle:
+
+```bash
+docker compose run --rm \
+  -v /path/to/TomatoWUR_trajectory:/data/TomatoWUR_trajectory \
+  interactive python3 /workspace/plant3d/TomatoWUR/data/TomatoWUR/build_partial_ann_version.py \
+  --annotations-root /data/TomatoWUR_trajectory/annotations_trajectory_sensor \
+  --point-clouds-root /data/TomatoWUR_trajectory/point_clouds_trajectory_sensor \
+  --version-name trajectory-sensor-plant \
+  --pairing-mode strict \
+  --split-unit plant \
+  --sequence-delimiter _sensor_ \
+  --train-ratio 0.8 \
+  --val-ratio 0.1 \
+  --test-ratio 0.1 \
+  --seed 123 \
+  --materialize-mode copy \
+  --dry-run
+```
+
+Use `--split-unit plant` for the future LSTM experiments. That keeps every
+trajectory from the same plant in the same split. `--split-unit sequence` is
+also supported, but different trajectories from the same plant can then land in
+different splits.
+
+For a trajectory bundle named `trajectory-sensor-plant`, the new training
+config expects:
+
+`TomatoWUR/data/TomatoWUR/ann_versions/trajectory-sensor-plant/json/`
+
 
 ## Training a PointCept:
 Training a semantic segmenation algorithm is done using the json in the dataset folder. See example below. (default training without pre-trained weights).
@@ -104,6 +174,33 @@ docker run --rmit --gpus all --shm-size 8g     -v /path/to/2D-to-3D_segmentation
         --options save_path=exp/ptv3-partial-v1-safe
     '
 ```
+
+### Trajectory-mode training
+Trajectory mode keeps the current frame predictor but feeds one ordered
+trajectory at a time. The trainer resets sequence state at the start of each
+trajectory and marks the last frame so an LSTM can be inserted later without
+changing the data pipeline again.
+
+```bash
+docker compose run --rm --gpus all interactive bash -lc '
+  cd /workspace/plant3d &&
+  export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True &&
+  python3 Pointcept/tools/train.py \
+    --config-file example_configs/semseg-pt-v3m1-0-base_TOMATOWUR_TRAJECTORY.py \
+    --num-gpus 1 \
+    --options \
+      data_root=TomatoWUR/data/TomatoWUR/ann_versions/trajectory-sensor-plant/json/ \
+      save_path=exp/ptv3-trajectory-sensor-plant
+'
+```
+
+The trajectory config uses:
+
+- `TomatoWURTrajectoryCSV`
+- `TrajectoryTrainer`
+- `TrajectorySegmentorV2`
+- `TrajectorySemSegEvaluator`
+- `TrajectorySemSegTester`
 
 ## Inference Pointcept
 This will run the algorithm with pt3 from paper. Saves the prediction in a npy file in the save_path + result folder. Weights are available on request.
@@ -124,6 +221,21 @@ docker run --rm --gpus all --shm-size 8g     -v /path/to/2D-to-3D_segmentation:/
           weight=/path/to/best/pointmodel.pth \
           save_path=example_data/output_ptv3_trained_partial_eval_full
     '
+```
+
+For trajectory-aware evaluation on labeled trajectory manifests:
+
+```bash
+docker compose run --rm --gpus all interactive bash -lc '
+  cd /workspace/plant3d &&
+  python3 Pointcept/tools/test.py \
+    --config-file example_configs/semseg-pt-v3m1-0-base_TOMATOWUR_TRAJECTORY.py \
+    --num-gpus 1 \
+    --options \
+      data_root=TomatoWUR/data/TomatoWUR/ann_versions/trajectory-sensor-plant/json/ \
+      weight=/path/to/best/pointmodel.pth \
+      save_path=exp/ptv3-trajectory-sensor-plant-eval
+'
 ```
 
 ## Visualizing Results

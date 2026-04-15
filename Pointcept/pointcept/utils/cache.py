@@ -6,7 +6,10 @@ Please cite our work if the code is helpful to you.
 """
 
 import os
-import SharedArray
+try:
+    import SharedArray
+except Exception:  # pragma: no cover - optional dependency
+    SharedArray = None
 
 try:
     from multiprocessing.shared_memory import ShareableList
@@ -17,7 +20,16 @@ except ImportError:
 import numpy as np
 
 
+def _require_shared_array():
+    if SharedArray is None:
+        raise RuntimeError(
+            "SharedArray is unavailable in this environment. Use cache=False or "
+            "install a compatible SharedArray build."
+        )
+
+
 def shared_array(name, var=None):
+    _require_shared_array()
     if var is not None:
         # check exist
         if os.path.exists(f"/dev/shm/{name}"):
@@ -32,6 +44,7 @@ def shared_array(name, var=None):
 
 
 def shared_dict(name, var=None):
+    _require_shared_array()
     name = str(name)
     assert "." not in name  # '.' is used as sep flag
     data = {}

@@ -22,7 +22,12 @@ from tensorboardX import SummaryWriter
 from .defaults import create_ddp_model, worker_init_fn
 from .hooks import HookBase, build_hooks
 import pointcept.utils.comm as comm
-from pointcept.datasets import build_dataset, point_collate_fn, collate_fn
+from pointcept.datasets import (
+    build_dataset,
+    point_collate_fn,
+    collate_fn,
+    trajectory_collate_fn,
+)
 from pointcept.models import build_model
 from pointcept.utils.logger import get_root_logger
 from pointcept.utils.optimizer import build_optimizer
@@ -32,6 +37,22 @@ from pointcept.utils.registry import Registry
 
 
 TRAINERS = Registry("trainers")
+
+
+def move_data_to_cuda(data):
+    if isinstance(data, torch.Tensor):
+        return data.cuda(non_blocking=True)
+    if isinstance(data, dict):
+        return {key: move_data_to_cuda(value) for key, value in data.items()}
+    if isinstance(data, list):
+        return [move_data_to_cuda(value) for value in data]
+    if isinstance(data, tuple):
+        return tuple(move_data_to_cuda(value) for value in data)
+    return data
+
+
+def unwrap_model(model):
+    return model.module if hasattr(model, "module") else model
 
 
 class TrainerBase:
@@ -346,3 +367,163 @@ class MultiDatasetTrainer(Trainer):
         )
         self.comm_info["iter_per_epoch"] = len(train_loader)
         return train_loader
+
+
+@TRAINERS.register_module("TrajectoryTrainer")
+class TrajectoryTrainer(Trainer):
+    def _reset_sequence_state(self):
+        model = unwrap_model(self.model)
+        if hasattr(model, "reset_sequence_state"):
+            model.reset_sequence_state()
+
+    def _build_init_fn(self):
+        return (
+            partial(
+                worker_init_fn,
+                num_workers=self.cfg.num_worker_per_gpu,
+                rank=comm.get_rank(),
+                seed=self.cfg.seed,
+            )
+            if self.cfg.seed is not None
+            else None
+        )
+
+    def build_train_loader(self):
+        if self.cfg.batch_size_per_gpu != 1:
+            raise ValueError(
+                "TrajectoryTrainer currently requires batch_size_per_gpu=1, got "
+                f"{self.cfg.batch_size_per_gpu}."
+            )
+        train_data = build_dataset(self.cfg.data.train)
+
+        if comm.get_world_size() > 1:
+            train_sampler = torch.utils.data.distributed.DistributedSampler(train_data)
+        else:
+            train_sampler = None
+
+        train_loader = torch.utils.data.DataLoader(
+            train_data,
+            batch_size=self.cfg.batch_size_per_gpu,
+            shuffle=(train_sampler is None),
+            num_workers=self.cfg.num_worker_per_gpu,
+            sampler=train_sampler,
+            collate_fn=trajectory_collate_fn,
+            pin_memory=True,
+            worker_init_fn=self._build_init_fn(),
+            drop_last=True,
+            persistent_workers=self.cfg.num_worker_per_gpu > 0,
+        )
+        return train_loader
+
+    def build_val_loader(self):
+        val_loader = None
+        if self.cfg.evaluate:
+            if self.cfg.batch_size_val_per_gpu != 1:
+                raise ValueError(
+                    "TrajectoryTrainer currently requires batch_size_val_per_gpu=1, got "
+                    f"{self.cfg.batch_size_val_per_gpu}."
+                )
+            val_data = build_dataset(self.cfg.data.val)
+            if comm.get_world_size() > 1:
+                val_sampler = torch.utils.data.distributed.DistributedSampler(val_data)
+            else:
+                val_sampler = None
+            val_loader = torch.utils.data.DataLoader(
+                val_data,
+                batch_size=self.cfg.batch_size_val_per_gpu,
+                shuffle=False,
+                num_workers=self.cfg.num_worker_per_gpu,
+                pin_memory=True,
+                sampler=val_sampler,
+                collate_fn=trajectory_collate_fn,
+                persistent_workers=self.cfg.num_worker_per_gpu > 0,
+            )
+        return val_loader
+
+    def run_step(self):
+        trajectory_dict = self.comm_info["input_dict"]
+        frames = trajectory_dict["frames"]
+        if not frames:
+            raise RuntimeError(
+                f"Trajectory {trajectory_dict.get('sequence_id', '<unknown>')} has no frames."
+            )
+
+        self._reset_sequence_state()
+        self.optimizer.zero_grad(set_to_none=True)
+        loss_terms = []
+        with torch.cuda.amp.autocast(enabled=self.cfg.enable_amp):
+            for frame in frames:
+                frame_input = move_data_to_cuda(frame)
+                output_dict = self.model(frame_input)
+                loss_terms.append(output_dict["loss"])
+            loss = torch.stack(loss_terms).mean()
+        self.comm_info["model_output_dict"] = {"loss": loss.detach()}
+
+        if not torch.isfinite(loss):
+            self.logger.warning(
+                "Skipping epoch %s iter %s sequence %s due to non-finite loss.",
+                self.epoch + 1,
+                self.comm_info["iter"] + 1,
+                trajectory_dict.get("sequence_id", "<unknown>"),
+            )
+            if "iter_info" in self.comm_info.keys():
+                self.comm_info["iter_info"] += "SkipNonFiniteLoss 1 "
+            self.optimizer.zero_grad(set_to_none=True)
+            self._reset_sequence_state()
+            if self.cfg.empty_cache:
+                torch.cuda.empty_cache()
+            return
+
+        grad_max_norm = getattr(self.cfg, "grad_max_norm", None)
+        if self.cfg.enable_amp:
+            self.scaler.scale(loss).backward()
+            if grad_max_norm is not None:
+                self.scaler.unscale_(self.optimizer)
+                grad_norm = nn.utils.clip_grad_norm_(
+                    self.model.parameters(), grad_max_norm
+                )
+                if not torch.isfinite(grad_norm).all():
+                    self.logger.warning(
+                        "Skipping epoch %s iter %s sequence %s due to non-finite grad norm.",
+                        self.epoch + 1,
+                        self.comm_info["iter"] + 1,
+                        trajectory_dict.get("sequence_id", "<unknown>"),
+                    )
+                    self.optimizer.zero_grad(set_to_none=True)
+                    if "iter_info" in self.comm_info.keys():
+                        self.comm_info["iter_info"] += "SkipNonFiniteGrad 1 "
+                    self._reset_sequence_state()
+                    if self.cfg.empty_cache:
+                        torch.cuda.empty_cache()
+                    return
+            self.scaler.step(self.optimizer)
+            scaler = self.scaler.get_scale()
+            self.scaler.update()
+            if scaler <= self.scaler.get_scale():
+                self.scheduler.step()
+        else:
+            loss.backward()
+            if grad_max_norm is not None:
+                grad_norm = nn.utils.clip_grad_norm_(
+                    self.model.parameters(), grad_max_norm
+                )
+                if not torch.isfinite(grad_norm).all():
+                    self.logger.warning(
+                        "Skipping epoch %s iter %s sequence %s due to non-finite grad norm.",
+                        self.epoch + 1,
+                        self.comm_info["iter"] + 1,
+                        trajectory_dict.get("sequence_id", "<unknown>"),
+                    )
+                    self.optimizer.zero_grad(set_to_none=True)
+                    if "iter_info" in self.comm_info.keys():
+                        self.comm_info["iter_info"] += "SkipNonFiniteGrad 1 "
+                    self._reset_sequence_state()
+                    if self.cfg.empty_cache:
+                        torch.cuda.empty_cache()
+                    return
+            self.optimizer.step()
+            self.scheduler.step()
+
+        self._reset_sequence_state()
+        if self.cfg.empty_cache:
+            torch.cuda.empty_cache()

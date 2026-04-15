@@ -55,5 +55,15 @@ def point_collate_fn(batch, mix_prob=0):
     return batch
 
 
+def trajectory_collate_fn(batch):
+    assert isinstance(batch, Sequence)
+    if len(batch) != 1:
+        raise ValueError(
+            "Trajectory collation currently supports batch_size=1 only. "
+            f"Received {len(batch)} trajectory items."
+        )
+    return batch[0]
+
+
 def gaussian_kernel(dist2: np.array, a: float = 1, c: float = 5):
     return a * np.exp(-dist2 / (2 * c**2))

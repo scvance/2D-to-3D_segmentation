@@ -16,7 +16,7 @@ import torch.utils.data
 
 from .defaults import create_ddp_model
 import pointcept.utils.comm as comm
-from pointcept.datasets import build_dataset, collate_fn
+from pointcept.datasets import build_dataset, collate_fn, trajectory_collate_fn
 from pointcept.models import build_model
 from pointcept.utils.logger import get_root_logger
 from pointcept.utils.registry import Registry
@@ -29,6 +29,22 @@ from pointcept.utils.misc import (
 
 
 TESTERS = Registry("testers")
+
+
+def move_data_to_cuda(data):
+    if isinstance(data, torch.Tensor):
+        return data.cuda(non_blocking=True)
+    if isinstance(data, dict):
+        return {key: move_data_to_cuda(value) for key, value in data.items()}
+    if isinstance(data, list):
+        return [move_data_to_cuda(value) for value in data]
+    if isinstance(data, tuple):
+        return tuple(move_data_to_cuda(value) for value in data)
+    return data
+
+
+def unwrap_model(model):
+    return model.module if hasattr(model, "module") else model
 
 
 class TesterBase:
@@ -333,6 +349,162 @@ class SemSegTester(TesterBase):
     @staticmethod
     def collate_fn(batch):
         return batch
+
+
+@TESTERS.register_module()
+class TrajectorySemSegTester(TesterBase):
+    def build_test_loader(self):
+        if self.cfg.batch_size_test_per_gpu != 1:
+            raise ValueError(
+                "TrajectorySemSegTester currently requires batch_size_test_per_gpu=1, got "
+                f"{self.cfg.batch_size_test_per_gpu}."
+            )
+        test_dataset = build_dataset(self.cfg.data.test)
+        if comm.get_world_size() > 1:
+            test_sampler = torch.utils.data.distributed.DistributedSampler(test_dataset)
+        else:
+            test_sampler = None
+        return torch.utils.data.DataLoader(
+            test_dataset,
+            batch_size=self.cfg.batch_size_test_per_gpu,
+            shuffle=False,
+            num_workers=self.cfg.num_worker_per_gpu,
+            pin_memory=True,
+            sampler=test_sampler,
+            collate_fn=trajectory_collate_fn,
+            persistent_workers=self.cfg.num_worker_per_gpu > 0,
+        )
+
+    def _reset_sequence_state(self):
+        model = unwrap_model(self.model)
+        if hasattr(model, "reset_sequence_state"):
+            model.reset_sequence_state()
+
+    def test(self):
+        logger = get_root_logger()
+        logger.info(">>>>>>>>>>>>>>>> Start Evaluation >>>>>>>>>>>>>>>>")
+        batch_time = AverageMeter()
+        intersection_meter = AverageMeter()
+        union_meter = AverageMeter()
+        target_meter = AverageMeter()
+        self.model.eval()
+        self._reset_sequence_state()
+
+        record = {}
+        for idx, trajectory_dict in enumerate(self.test_loader):
+            end = time.time()
+            frames = trajectory_dict["frames"]
+            sequence_id = trajectory_dict.get("sequence_id", f"trajectory_{idx}")
+            if not frames:
+                raise RuntimeError(f"Trajectory {sequence_id} has no frames.")
+
+            self._reset_sequence_state()
+            trajectory_intersection = np.zeros(self.cfg.data.num_classes)
+            trajectory_union = np.zeros(self.cfg.data.num_classes)
+            trajectory_target = np.zeros(self.cfg.data.num_classes)
+            frame_losses = []
+            for frame in frames:
+                frame_input = move_data_to_cuda(frame)
+                with torch.no_grad():
+                    output_dict = self.model(frame_input)
+                output = output_dict["seg_logits"]
+                pred = output.max(1)[1]
+                segment = frame_input["segment"]
+                intersection, union, target = intersection_and_union_gpu(
+                    pred,
+                    segment,
+                    self.cfg.data.num_classes,
+                    self.cfg.data.ignore_index,
+                )
+                if comm.get_world_size() > 1:
+                    dist.all_reduce(intersection), dist.all_reduce(union), dist.all_reduce(
+                        target
+                    )
+                intersection = intersection.cpu().numpy()
+                union = union.cpu().numpy()
+                target = target.cpu().numpy()
+                trajectory_intersection += intersection
+                trajectory_union += union
+                trajectory_target += target
+                if "loss" in output_dict:
+                    frame_losses.append(output_dict["loss"].item())
+
+            intersection_meter.update(trajectory_intersection)
+            union_meter.update(trajectory_union)
+            target_meter.update(trajectory_target)
+            record[sequence_id] = dict(
+                intersection=trajectory_intersection,
+                union=trajectory_union,
+                target=trajectory_target,
+            )
+
+            mask = trajectory_union != 0
+            iou_class = trajectory_intersection / (trajectory_union + 1e-10)
+            iou = np.mean(iou_class[mask]) if mask.any() else 0.0
+            acc = sum(trajectory_intersection) / (sum(trajectory_target) + 1e-10)
+            m_iou = np.mean(intersection_meter.sum / (union_meter.sum + 1e-10))
+            m_acc = np.mean(intersection_meter.sum / (target_meter.sum + 1e-10))
+            batch_time.update(time.time() - end)
+            loss_info = (
+                f" Loss {sum(frame_losses) / len(frame_losses):.4f}"
+                if frame_losses
+                else ""
+            )
+            logger.info(
+                "Test: {sequence_id} [{idx}/{total}] Frames {num_frames} "
+                "Batch {batch_time.val:.3f} ({batch_time.avg:.3f}) "
+                "Accuracy {acc:.4f} ({m_acc:.4f}) "
+                "mIoU {iou:.4f} ({m_iou:.4f}){loss_info}".format(
+                    sequence_id=sequence_id,
+                    idx=idx + 1,
+                    total=len(self.test_loader),
+                    num_frames=len(frames),
+                    batch_time=batch_time,
+                    acc=acc,
+                    m_acc=m_acc,
+                    iou=iou,
+                    m_iou=m_iou,
+                    loss_info=loss_info,
+                )
+            )
+            self._reset_sequence_state()
+
+        logger.info("Syncing ...")
+        comm.synchronize()
+        record_sync = comm.gather(record, dst=0)
+        if comm.is_main_process():
+            merged = {}
+            for _ in range(len(record_sync)):
+                merged.update(record_sync.pop())
+            intersection = np.sum(
+                [meters["intersection"] for meters in merged.values()], axis=0
+            )
+            union = np.sum([meters["union"] for meters in merged.values()], axis=0)
+            target = np.sum([meters["target"] for meters in merged.values()], axis=0)
+            iou_class = intersection / (union + 1e-10)
+            accuracy_class = intersection / (target + 1e-10)
+            m_iou = np.mean(iou_class)
+            m_acc = np.mean(accuracy_class)
+            all_acc = sum(intersection) / (sum(target) + 1e-10)
+            logger.info(
+                "Val result: mIoU/mAcc/allAcc {:.4f}/{:.4f}/{:.4f}".format(
+                    m_iou, m_acc, all_acc
+                )
+            )
+            for i in range(self.cfg.data.num_classes):
+                logger.info(
+                    "Class_{idx} - {name} Result: iou/accuracy {iou:.4f}/{accuracy:.4f}".format(
+                        idx=i,
+                        name=self.cfg.data.names[i],
+                        iou=iou_class[i],
+                        accuracy=accuracy_class[i],
+                    )
+                )
+        logger.info("<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<")
+
+    @staticmethod
+    def collate_fn(batch):
+        return trajectory_collate_fn(batch)
 
 
 @TESTERS.register_module()

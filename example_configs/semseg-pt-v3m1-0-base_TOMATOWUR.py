@@ -12,8 +12,8 @@ grad_max_norm = 1.0
 # dataset settings
 # dataset_type = "MarvinDatasetCSV"
 dataset_type = "TomatoWURCSV"
-# data_root = "TomatoWUR/data/TomatoWUR/ann_versions/partial-v1/json/" 
-data_root = "TomatoWUR/data/TomatoWUR/ann_versions/0-paper-2Dto3D/json/"
+data_root = "TomatoWUR/data/TomatoWUR/ann_versions/partial-sensor-frame/json/" 
+# data_root = "TomatoWUR/data/TomatoWUR/ann_versions/0-paper-2Dto3D/json/"
 
 train_name = data_root + "train.json"
 val_name = data_root + "val.json"

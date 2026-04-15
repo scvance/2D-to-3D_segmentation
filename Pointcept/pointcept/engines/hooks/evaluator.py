@@ -18,6 +18,22 @@ from .default import HookBase
 from .builder import HOOKS
 
 
+def move_data_to_cuda(data):
+    if isinstance(data, torch.Tensor):
+        return data.cuda(non_blocking=True)
+    if isinstance(data, dict):
+        return {key: move_data_to_cuda(value) for key, value in data.items()}
+    if isinstance(data, list):
+        return [move_data_to_cuda(value) for value in data]
+    if isinstance(data, tuple):
+        return tuple(move_data_to_cuda(value) for value in data)
+    return data
+
+
+def unwrap_model(model):
+    return model.module if hasattr(model, "module") else model
+
+
 @HOOKS.register_module()
 class ClsEvaluator(HookBase):
     def after_epoch(self):
@@ -194,6 +210,108 @@ class SemSegEvaluator(HookBase):
         self.trainer.logger.info("<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<")
         self.trainer.comm_info["current_metric_value"] = m_iou  # save for saver
         self.trainer.comm_info["current_metric_name"] = "mIoU"  # save for saver
+
+    def after_train(self):
+        self.trainer.logger.info(
+            "Best {}: {:.4f}".format("mIoU", self.trainer.best_metric_value)
+        )
+
+
+@HOOKS.register_module()
+class TrajectorySemSegEvaluator(HookBase):
+    def after_epoch(self):
+        if self.trainer.cfg.evaluate:
+            self.eval()
+
+    def _reset_sequence_state(self):
+        model = unwrap_model(self.trainer.model)
+        if hasattr(model, "reset_sequence_state"):
+            model.reset_sequence_state()
+
+    def eval(self):
+        self.trainer.logger.info(">>>>>>>>>>>>>>>> Start Evaluation >>>>>>>>>>>>>>>>")
+        self.trainer.model.eval()
+        self._reset_sequence_state()
+        for i, trajectory_dict in enumerate(self.trainer.val_loader):
+            frames = trajectory_dict["frames"]
+            if not frames:
+                raise RuntimeError(
+                    f"Trajectory {trajectory_dict.get('sequence_id', '<unknown>')} has no frames."
+                )
+            self._reset_sequence_state()
+            frame_losses = []
+            for frame in frames:
+                frame_input = move_data_to_cuda(frame)
+                with torch.no_grad():
+                    output_dict = self.trainer.model(frame_input)
+                output = output_dict["seg_logits"]
+                loss = output_dict["loss"]
+                pred = output.max(1)[1]
+                segment = frame_input["segment"]
+                intersection, union, target = intersection_and_union_gpu(
+                    pred,
+                    segment,
+                    self.trainer.cfg.data.num_classes,
+                    self.trainer.cfg.data.ignore_index,
+                )
+                if comm.get_world_size() > 1:
+                    dist.all_reduce(intersection), dist.all_reduce(union), dist.all_reduce(
+                        target
+                    )
+                intersection, union, target = (
+                    intersection.cpu().numpy(),
+                    union.cpu().numpy(),
+                    target.cpu().numpy(),
+                )
+                self.trainer.storage.put_scalar("val_intersection", intersection)
+                self.trainer.storage.put_scalar("val_union", union)
+                self.trainer.storage.put_scalar("val_target", target)
+                frame_losses.append(loss.item())
+            trajectory_loss = float(sum(frame_losses) / len(frame_losses))
+            self.trainer.storage.put_scalar("val_loss", trajectory_loss)
+            self.trainer.logger.info(
+                "Test: [{iter}/{max_iter}] Sequence {sequence_id} Frames {num_frames} Loss {loss:.4f}".format(
+                    iter=i + 1,
+                    max_iter=len(self.trainer.val_loader),
+                    sequence_id=trajectory_dict.get("sequence_id", "<unknown>"),
+                    num_frames=len(frames),
+                    loss=trajectory_loss,
+                )
+            )
+            self._reset_sequence_state()
+
+        loss_avg = self.trainer.storage.history("val_loss").avg
+        intersection = self.trainer.storage.history("val_intersection").total
+        union = self.trainer.storage.history("val_union").total
+        target = self.trainer.storage.history("val_target").total
+        iou_class = intersection / (union + 1e-10)
+        acc_class = intersection / (target + 1e-10)
+        m_iou = np.mean(iou_class)
+        m_acc = np.mean(acc_class)
+        all_acc = sum(intersection) / (sum(target) + 1e-10)
+        self.trainer.logger.info(
+            "Val result: mIoU/mAcc/allAcc {:.4f}/{:.4f}/{:.4f}.".format(
+                m_iou, m_acc, all_acc
+            )
+        )
+        for i in range(self.trainer.cfg.data.num_classes):
+            self.trainer.logger.info(
+                "Class_{idx}-{name} Result: iou/accuracy {iou:.4f}/{accuracy:.4f}".format(
+                    idx=i,
+                    name=self.trainer.cfg.data.names[i],
+                    iou=iou_class[i],
+                    accuracy=acc_class[i],
+                )
+            )
+        current_epoch = self.trainer.epoch + 1
+        if self.trainer.writer is not None:
+            self.trainer.writer.add_scalar("val/loss", loss_avg, current_epoch)
+            self.trainer.writer.add_scalar("val/mIoU", m_iou, current_epoch)
+            self.trainer.writer.add_scalar("val/mAcc", m_acc, current_epoch)
+            self.trainer.writer.add_scalar("val/allAcc", all_acc, current_epoch)
+        self.trainer.logger.info("<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<")
+        self.trainer.comm_info["current_metric_value"] = m_iou
+        self.trainer.comm_info["current_metric_name"] = "mIoU"
 
     def after_train(self):
         self.trainer.logger.info(

@@ -114,6 +114,43 @@ If you find _Pointcept_ useful to your research, please cite our work as encoura
 - [Citation](#citation)
 - [Acknowledgement](#acknowledgement)
 
+## Local TomatoWUR Trajectory Extension
+
+This fork also contains a TomatoWUR-specific trajectory path for sequential
+experiments in the parent `2D-to-3D_segmentation` repository. The added local
+pieces are:
+
+- `pointcept/datasets/tomatowur_trajectory_csv.py`
+- `pointcept/datasets/utils.py::trajectory_collate_fn`
+- `pointcept/models/default.py::TrajectorySegmentorV2`
+- `pointcept/engines/train.py::TrajectoryTrainer`
+- `pointcept/engines/hooks/evaluator.py::TrajectorySemSegEvaluator`
+- `pointcept/engines/test.py::TrajectorySemSegTester`
+
+The matching config lives in the parent repo at:
+
+- `example_configs/semseg-pt-v3m1-0-base_TOMATOWUR_TRAJECTORY.py`
+
+Typical training command from the parent repo root:
+
+```bash
+docker compose run --rm --gpus all interactive bash -lc '
+  cd /workspace/plant3d &&
+  export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True &&
+  python3 Pointcept/tools/train.py \
+    --config-file example_configs/semseg-pt-v3m1-0-base_TOMATOWUR_TRAJECTORY.py \
+    --num-gpus 1 \
+    --options \
+      data_root=TomatoWUR/data/TomatoWUR/ann_versions/trajectory-sensor-plant/json/ \
+      save_path=exp/ptv3-trajectory-sensor-plant
+'
+```
+
+Generate the required `*_trajectories.json` manifests first with
+`TomatoWUR/data/TomatoWUR/build_partial_ann_version.py --split-unit plant`.
+Detailed splitter commands are documented in the parent repo `readme.md` and in
+`TomatoWUR/data/README.txt`.
+
 ## Installation
 
 ### Requirements
