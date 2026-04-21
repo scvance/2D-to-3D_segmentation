@@ -17,9 +17,12 @@ classes = ["leaves", "main_stem", "pole", "side_stem"]
 grid_size = 0.002
 
 model = dict(
-    type="TrajectorySegmentorV2",
+    type="TrajectoryLSTMSegmentorV2",
     num_classes=len(classes),
     backbone_out_channels=64,
+    lstm_hidden_channels=512,
+    temporal_fusion="add",
+    temporal_dropout=0.0,
     backbone=dict(
         type="PT-v3m1",
         in_channels=6,

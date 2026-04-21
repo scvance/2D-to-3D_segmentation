@@ -1,3 +1,4 @@
+import torch
 import torch.nn as nn
 
 from pointcept.models.losses import build_criteria
@@ -131,6 +132,108 @@ class TrajectorySegmentorV2(DefaultSegmentorV2):
             output_dict = dict(loss=loss, seg_logits=seg_logits)
         else:
             output_dict = dict(seg_logits=seg_logits)
+        if bool(input_dict.get("is_last_frame", False)):
+            self.reset_sequence_state()
+        return output_dict
+
+
+@MODELS.register_module()
+class TrajectoryLSTMSegmentorV2(TrajectorySegmentorV2):
+    def __init__(
+        self,
+        num_classes,
+        backbone_out_channels,
+        backbone=None,
+        criteria=None,
+        lstm_hidden_channels=None,
+        temporal_fusion="add",
+        temporal_dropout=0.0,
+    ):
+        super().__init__(
+            num_classes=num_classes,
+            backbone_out_channels=backbone_out_channels,
+            backbone=backbone,
+            criteria=criteria,
+        )
+        bottleneck_channels = getattr(self.backbone, "bottleneck_channels", None)
+        if bottleneck_channels is None:
+            raise AttributeError(
+                "TrajectoryLSTMSegmentorV2 requires the backbone to expose "
+                "'bottleneck_channels'."
+            )
+        if temporal_fusion != "add":
+            raise ValueError(
+                "TrajectoryLSTMSegmentorV2 currently supports only "
+                "temporal_fusion='add'."
+            )
+
+        self.temporal_fusion = temporal_fusion
+        self.bottleneck_channels = bottleneck_channels
+        self.lstm_hidden_channels = lstm_hidden_channels or bottleneck_channels
+        self.temporal_dropout = nn.Dropout(temporal_dropout)
+        self.lstm = nn.LSTMCell(
+            input_size=self.bottleneck_channels,
+            hidden_size=self.lstm_hidden_channels,
+        )
+        self.temporal_proj = (
+            nn.Identity()
+            if self.lstm_hidden_channels == self.bottleneck_channels
+            else nn.Linear(self.lstm_hidden_channels, self.bottleneck_channels)
+        )
+        self.cell_state = None
+
+    def reset_sequence_state(self):
+        super().reset_sequence_state()
+        self.cell_state = None
+
+    def _pool_frame_embedding(self, point):
+        if point.offset.numel() == 1:
+            return point.feat.mean(dim=0, keepdim=True)
+
+        pooled = []
+        start = 0
+        for end in point.offset.tolist():
+            pooled.append(point.feat[start:end].mean(dim=0, keepdim=True))
+            start = end
+        return torch.cat(pooled, dim=0)
+
+    def _update_temporal_state(self, frame_embedding):
+        if self.hidden_state is None or self.cell_state is None:
+            hidden_state, cell_state = self.lstm(frame_embedding)
+        else:
+            hidden_state, cell_state = self.lstm(
+                frame_embedding, (self.hidden_state, self.cell_state)
+            )
+        self.hidden_state = hidden_state.detach()
+        self.cell_state = cell_state.detach()
+        return hidden_state
+
+    def _fuse_temporal_context(self, point, hidden_state):
+        temporal_context = self.temporal_proj(self.temporal_dropout(hidden_state))
+        if self.temporal_fusion == "add":
+            point.feat = point.feat + temporal_context.expand(point.feat.shape[0], -1)
+            return point
+        raise RuntimeError(f"Unsupported temporal_fusion={self.temporal_fusion}")
+
+    def forward(self, input_dict):
+        self._update_sequence_state(input_dict)
+        frame_input = self._frame_input_dict(input_dict)
+        point = Point(frame_input)
+        point = self.backbone.forward_encoder(point)
+        frame_embedding = self._pool_frame_embedding(point)
+        hidden_state = self._update_temporal_state(frame_embedding)
+        point = self._fuse_temporal_context(point, hidden_state)
+        point = self.backbone.forward_decoder(point)
+        seg_logits = self.seg_head(point.feat)
+
+        if self.training:
+            output_dict = dict(loss=self.criteria(seg_logits, frame_input["segment"]))
+        elif "segment" in frame_input.keys():
+            loss = self.criteria(seg_logits, frame_input["segment"])
+            output_dict = dict(loss=loss, seg_logits=seg_logits)
+        else:
+            output_dict = dict(seg_logits=seg_logits)
+
         if bool(input_dict.get("is_last_frame", False)):
             self.reset_sequence_state()
         return output_dict

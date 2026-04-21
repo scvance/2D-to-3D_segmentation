@@ -555,6 +555,7 @@ class PointTransformerV3(PointModule):
         self.order = [order] if isinstance(order, str) else order
         self.cls_mode = cls_mode
         self.shuffle_orders = shuffle_orders
+        self.bottleneck_channels = enc_channels[-1]
 
         assert self.num_stages == len(stride) + 1
         assert self.num_stages == len(enc_depths)
@@ -696,15 +697,24 @@ class PointTransformerV3(PointModule):
                     )
                 self.dec.add(module=dec, name=f"dec{s}")
 
-    def forward(self, data_dict):
-        point = Point(data_dict)
-        point.serialization(order=self.order, shuffle_orders=self.shuffle_orders)
-        point.sparsify()
-
+    def forward_encoder(self, data_dict):
+        point = data_dict if isinstance(data_dict, Point) else Point(data_dict)
+        if "serialized_order" not in point.keys():
+            point.serialization(order=self.order, shuffle_orders=self.shuffle_orders)
+        if "sparse_conv_feat" not in point.keys():
+            point.sparsify()
         point = self.embedding(point)
         point = self.enc(point)
+        return point
+
+    def forward_decoder(self, point):
         if not self.cls_mode:
             point = self.dec(point)
+        return point
+
+    def forward(self, data_dict):
+        point = self.forward_encoder(data_dict)
+        point = self.forward_decoder(point)
         # else:
         #     point.feat = torch_scatter.segment_csr(
         #         src=point.feat,
